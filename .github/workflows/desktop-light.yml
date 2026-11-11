@@ -103,13 +103,21 @@ jobs:
             --work "$env:RUNNER_TEMP/desktop-job" `
             --cache "$env:GITHUB_WORKSPACE/.cache/desktop-inputs"
 
-      - name: 把打包目标从 msix 改成 unpacked（1 行替换）
+      - name: 把打包目标从 msix 改成 unpacked（1 行替换 + 让 git 忽略这处改动）
         shell: pwsh
         run: |
           # 上游 desktop.py 给 win32 硬编码了 ["--win","msix"]，而我们只要未签名 unpacked。
-          # 注意：不能只追加 `--dir` —— desktop.py 会把 `--win msix` 一起传下去，
-          # electron-builder 见显式 target 就不会走 DIR_TARGET（实测其 normalizeOptions:
-          # `if (types.length === 0) { setEmptyTypes(...) }`），结果仍然出 msix。
+          #
+          # 注意 1：不能只追加 `--dir` —— desktop.py 会把 `--win msix` 一起传下去，
+          #   electron-builder 见显式 target 就不走 DIR_TARGET（其 normalizeOptions:
+          #   `if (types.length === 0) { setEmptyTypes(...) }`），结果仍然出 msix。
+          #
+          # 注意 2：desktop.py 的 require_source() 要求 HEAD == 采纳的 commit 且
+          #   `git status --porcelain --untracked-files=all` 为空（PreparedDesktop.validate()
+          #   在 Build 一开头就调用它）。改了文件就等于弄脏工作区，会直接报
+          #   "desktop builds require a clean source checkout at the admitted revision"。
+          #   因此改完立刻 `git update-index --assume-unchanged`，让 git 不再跟踪这处改动
+          #   （HEAD 不变、文件内容确实是新的）。删掉这行会重现该失败。
           $f = "scripts/bundles/desktop.py"
           $path = (Resolve-Path $f).Path
           $t = [IO.File]::ReadAllText($path)
@@ -119,7 +127,11 @@ jobs:
             throw "上游 desktop.py 的目标行已变化，本 workflow 的替换规则需要更新（否则会继续产出 msix）"
           }
           [IO.File]::WriteAllText($path, $t.Replace($old, $new), (New-Object System.Text.UTF8Encoding($false)))
+          git update-index --assume-unchanged $f
+          $status = @(git status --porcelain --untracked-files=all)
+          if ($status.Count -gt 0) { throw ("工作区仍不干净（require_source 会失败）：`n" + ($status -join "`n")) }
           Select-String -Path $f -Pattern 'targets = \{' | ForEach-Object { "  target -> " + $_.Line.Trim() }
+          Write-Host "git status 干净（assume-unchanged 生效），HEAD = $(git rev-parse --short HEAD)"
 
       - name: Build（走官方 driver，目标已被上一步改成 --dir）
         shell: pwsh
