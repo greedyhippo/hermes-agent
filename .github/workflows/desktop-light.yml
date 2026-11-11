@@ -1,0 +1,232 @@
+# Hermes Light（remote-only 桌面客户端）Windows x64 构建
+#
+# 放在你自己的 fork 里即可，fork 中只有这一个文件；源码每次都从上游 NousResearch/hermes-agent 检出，
+# 所以不需要同步 fork、也不会带上任何本地内容。
+#
+# 关键点（都是踩过的坑，改动前请读）：
+#   * 必须用 scripts/bundles/desktop.py 而不是手写 `npm run pack` / `pnpm run pack`：
+#     它在 identity_environment() 里自己设置 HERMES_DESKTOP_VARIANT 与 GITHUB_SHA=request.commit，
+#     所以产物是真正的 light 身份（Hermes Light.exe / appId ...hermes-light / 通道 light），
+#     install-stamp.json 的 commit 也是上游 commit，而不是本 workflow 仓库的 HEAD。
+#   * 不要设置 HERMES_BUILD_COMMIT：一旦设置，身份会变成 "Hermes Light <sha7>"、通道变 null、
+#     appId 带后缀，与你已有的安装不共享 userData。
+#   * 标准 Windows runner 只有 14 GB SSD，所以首版不做大缓存（只缓 electron / electron-builder
+#     的下载缓存，约 200 MB），必要时再按实测加。
+#   * 产物走 Release（不占 Actions artifacts 的 500 MB 额度），保留最近 N 个。
+#   * 本 workflow 只出包：部署脚本不进仓库、不进 CI，由你本地的 build-light.ps1 -Deploy 完成。
+name: Desktop Light (win x64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "上游 ref（tag / 分支 / 40 位 SHA），例如 v0.23.0 或 main"
+        required: true
+        default: "main"
+      publish_release:
+        description: "构建后发布到本仓库 Release"
+        type: boolean
+        default: true
+      keep_releases:
+        description: "Release 保留份数（0 = 不清理）"
+        type: string
+        default: "3"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-light-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Light ${{ inputs.ref }}
+    runs-on: windows-2022          # 4 vCPU / 16 GB RAM / 14 GB SSD
+    timeout-minutes: 60
+
+    env:
+      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}\.cache\electron-builder
+      # 只打印、不参与计费；真正决定身份的是 desktop.py 内部注入的变量
+      HERMES_DESKTOP_VARIANT: light
+
+    steps:
+      - name: 检出上游源码
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 解析 commit 并做前置断言
+        id: src
+        shell: pwsh
+        run: |
+          $sha = (git rev-parse HEAD).Trim()
+          if ($sha -notmatch '^[0-9a-f]{40}$') { throw "无法解析 HEAD：$sha" }
+          $short = $sha.Substring(0, 7)
+          "sha=$sha"     >> $env:GITHUB_OUTPUT
+          "short=$short" >> $env:GITHUB_OUTPUT
+          git log -1 --oneline
+
+      - name: 引导 Python（仅用于跑 desktop.py；pinned 工具链由它自己装）
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Defender 排除构建目录（官方发布流程同款，显著提速）
+        shell: powershell
+        run: |
+          foreach ($p in @($env:GITHUB_WORKSPACE, $env:RUNNER_TEMP)) {
+            try { Add-MpPreference -ExclusionPath $p; Write-Host "excluded: $p" }
+            catch { Write-Host "skip $p ($($_.Exception.Message))" }
+          }
+
+      - name: 恢复下载缓存（只缓 electron / builder，不缓 desktop-inputs）
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache\electron-builder
+            .cache\desktop-inputs\packager
+          key: light-win-${{ steps.src.outputs.sha }}-${{ hashFiles('pm/lock.json', 'pnpm-lock.yaml') }}
+          restore-keys: |
+            light-win-
+
+      - name: Prepare（装 pinned python/node/pnpm、依赖、Electron 运行时）
+        shell: pwsh
+        run: |
+          python scripts/bundles/desktop.py `
+            --commit=${{ steps.src.outputs.sha }} `
+            --variant light `
+            --prepare-only `
+            --work "$env:RUNNER_TEMP/desktop-job" `
+            --cache "$env:GITHUB_WORKSPACE/.cache/desktop-inputs"
+
+      - name: 把打包目标从 msix 改成 unpacked（1 行替换）
+        shell: pwsh
+        run: |
+          # 上游 desktop.py 给 win32 硬编码了 ["--win","msix"]，而我们只要未签名 unpacked。
+          # 注意：不能只追加 `--dir` —— desktop.py 会把 `--win msix` 一起传下去，
+          # electron-builder 见显式 target 就不会走 DIR_TARGET（实测其 normalizeOptions:
+          # `if (types.length === 0) { setEmptyTypes(...) }`），结果仍然出 msix。
+          $f = "scripts/bundles/desktop.py"
+          $path = (Resolve-Path $f).Path
+          $t = [IO.File]::ReadAllText($path)
+          $old = 'targets = {"win32": ["--win", "msix"], "darwin": ["--mac", "dmg", "zip"], "linux": ["--linux", "AppImage"]}[sys.platform]'
+          $new = 'targets = {"win32": ["--dir"], "darwin": ["--mac", "dmg", "zip"], "linux": ["--linux", "AppImage"]}[sys.platform]'
+          if (-not $t.Contains($old)) {
+            throw "上游 desktop.py 的目标行已变化，本 workflow 的替换规则需要更新（否则会继续产出 msix）"
+          }
+          [IO.File]::WriteAllText($path, $t.Replace($old, $new), (New-Object System.Text.UTF8Encoding($false)))
+          Select-String -Path $f -Pattern 'targets = \{' | ForEach-Object { "  target -> " + $_.Line.Trim() }
+
+      - name: Build（走官方 driver，目标已被上一步改成 --dir）
+        shell: pwsh
+        run: |
+          python scripts/bundles/desktop.py `
+            --prepared "$env:RUNNER_TEMP/desktop-job/prepared.json" `
+            --variant light
+
+      - name: 断言产物（不通过必须失败，而不是发一个错包）
+        id: verify
+        shell: pwsh
+        run: |
+          $app = "apps/desktop/release/win-unpacked"
+          if (!(Test-Path $app)) { throw "没有 win-unpacked 目录：$app" }
+          if (!(Test-Path (Join-Path $app "Hermes Light.exe"))) {
+            throw "变体没生效：缺少 Hermes Light.exe（若出现 Hermes.exe 说明 HERMES_DESKTOP_VARIANT 没传到 pack 阶段）"
+          }
+          if (Test-Path (Join-Path $app "resources/agent-payload")) {
+            throw "light 变体不应包含 resources/agent-payload"
+          }
+          $stampPath = Join-Path $app "resources/install-stamp.json"
+          if (!(Test-Path $stampPath)) { throw "缺少 install-stamp.json" }
+          $stamp = Get-Content $stampPath -Raw | ConvertFrom-Json
+          if ($stamp.payload -ne "bootstrap") { throw "stamp.payload=$($stamp.payload)，期望 bootstrap" }
+          if ($stamp.commit -ne "${{ steps.src.outputs.sha }}") {
+            throw "stamp.commit=$($stamp.commit) 与检出 commit 不一致"
+          }
+          $files = @(Get-ChildItem $app -Recurse -Force -File)
+          $mb = [math]::Round((($files | Measure-Object Length -Sum).Sum / 1MB), 0)
+          Write-Host "files=$($files.Count) sizeMB=$mb"
+          if ($mb -lt 300 -or $mb -gt 900) { throw "体积异常：${mb} MB（预期 350-500 MB）" }
+          "sizeMB=$mb" >> $env:GITHUB_OUTPUT
+          Copy-Item $stampPath "install-stamp.json"
+          Get-Content "install-stamp.json" -Raw
+
+      - name: 打 ZIP（zip 根目录必须是 Hermes Light.exe 那一层）
+        shell: pwsh
+        run: |
+          $zip = "Hermes-Light-${{ steps.src.outputs.short }}-win-x64.zip"
+          Compress-Archive -Path "apps/desktop/release/win-unpacked/*" -DestinationPath $zip -CompressionLevel Optimal
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Set-Content "$zip.sha256" -Encoding ascii
+          $zipMB = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          Write-Host "zip=$zip sizeMB=$zipMB"
+          Write-Host "sha256=$hash"
+          # 结构自检：解压一层后 exe 必须在根
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $z = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip).Path)
+          try {
+            $rootExe = $z.Entries | Where-Object { $_.FullName -eq "Hermes Light.exe" }
+            if (-not $rootExe) { throw "zip 根目录没有 Hermes Light.exe（-Deploy 会拒绝这种结构）" }
+            Write-Host "entries=$($z.Entries.Count)"
+          } finally { $z.Dispose() }
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+        id: pack
+
+      - name: 上传 Actions 产物（仅在不发 Release 时保留，排障用）
+        if: ${{ !inputs.publish_release }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-light-${{ steps.src.outputs.short }}
+          path: |
+            Hermes-Light-${{ steps.src.outputs.short }}-win-x64.zip
+            Hermes-Light-${{ steps.src.outputs.short }}-win-x64.zip.sha256
+            install-stamp.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: 发布到 Release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: light-${{ steps.src.outputs.short }}
+          name: Hermes Light ${{ steps.src.outputs.short }} (win x64)
+          make_latest: false
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          body: |
+            上游 commit: `${{ steps.src.outputs.sha }}`（ref: `${{ inputs.ref }}`）
+            变体: light（remote-only，无 agent payload、无 Python 运行时）
+            产物: 未签名 portable ZIP，解压后执行 `Hermes Light.exe`
+
+            部署（本机无需任何构建工具，用你本地的 build-light.ps1）:
+            ```powershell
+            Expand-Archive Hermes-Light-${{ steps.src.outputs.short }}-win-x64.zip -DestinationPath "$env:TEMP\hl-${{ steps.src.outputs.short }}"
+            D:\exmon\Tools\HermesLight\build-light.ps1 -Deploy "$env:TEMP\hl-${{ steps.src.outputs.short }}"
+            ```
+            校验: 见同名 `.sha256`；`resources/install-stamp.json` 里 commit 应与上面一致。
+          files: |
+            Hermes-Light-${{ steps.src.outputs.short }}-win-x64.zip
+            Hermes-Light-${{ steps.src.outputs.short }}-win-x64.zip.sha256
+            install-stamp.json
+
+      - name: 清理过旧 Release（保留最新 N 份）
+        if: ${{ inputs.publish_release && inputs.keep_releases != '0' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: ${{ inputs.keep_releases }}
+        run: |
+          $repo = "${{ github.repository }}"
+          $tags = @(gh release list --repo $repo --limit 50 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[] | .tagName' |
+                    Where-Object { $_ -like 'light-*' })
+          Write-Host "现有 light 发布（$repo）：$($tags -join ', ')"
+          $drop = @($tags | Select-Object -Skip ([int]$env:KEEP))
+          foreach ($t in $drop) {
+            Write-Host "删除旧发布 $t"
+            gh release delete $t --repo $repo --yes --cleanup-tag
+          }
