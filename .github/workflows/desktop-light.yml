@@ -238,12 +238,15 @@ jobs:
             变体: light（remote-only，无 agent payload、无 Python 运行时）
             产物: 未签名 portable ZIP，解压后执行 `Hermes Light.exe`
 
-            部署（本机无需任何构建工具，用你本地的 build-light.ps1）:
+            部署（本机无需任何构建工具，用 deploy-light.ps1）:
             ```powershell
-            Expand-Archive Hermes-Light-${{ steps.src.outputs.short }}-win-x64.zip -DestinationPath "$env:TEMP\hl-${{ steps.src.outputs.short }}"
-            D:\exmon\Tools\HermesLight\build-light.ps1 -Deploy "$env:TEMP\hl-${{ steps.src.outputs.short }}"
+            # 下载 zip 后直接运行；省略 -Zip 会自动取 Downloads 里最新的匹配包
+            D:\exmon\Tools\HermesLight\deploy-light.ps1
+            # 或指定具体包：
+            D:\exmon\Tools\HermesLight\deploy-light.ps1 -Zip "$env:USERPROFILE\Downloads\Hermes-Light-${{ steps.src.outputs.short }}-win-x64.zip"
             ```
-            校验: 见同名 `.sha256`；`resources/install-stamp.json` 里 commit 应与上面一致。
+            脚本会自行校验同名 `.sha256`、比对 `resources/install-stamp.json` 的 commit（同一 commit 自动跳过），
+            并完成「结束旧进程 → 同卷改名 → 复制校验 → 删除改名目录」；首次运行可用你存放脚本的路径，之后它会把自己放回上面的固定目录。
           files: |
             Hermes-Light-${{ steps.src.outputs.short }}-win-x64.zip
             Hermes-Light-${{ steps.src.outputs.short }}-win-x64.zip.sha256
