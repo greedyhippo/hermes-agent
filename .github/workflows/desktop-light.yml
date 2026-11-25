@@ -121,10 +121,7 @@ jobs:
           $edits = @(
             @{ File = 'scripts/bundles/desktop.py'
                Old  = '"win32": ["--win", "msix"]'
-               New  = '"win32": ["--dir"]' },
-            @{ File = 'scripts/bundles/desktop_inputs.py'
-               Old  = '        env["HERMES_BUILD_COMMIT"] = request.commit'
-               New  = '        env.pop("HERMES_BUILD_COMMIT", None)  # CI: no sha7-suffixed identity' }
+               New  = '"win32": ["--dir"]' }
           )
           foreach ($e in $edits) {
             $path = (Resolve-Path $e.File).Path
@@ -137,6 +134,20 @@ jobs:
             git update-index --assume-unchanged $e.File
             Write-Host "  patched: $($e.File)"
           }
+
+          # 上游 825d07e（2026-11-22）起 desktop_inputs.py 有两处 HERMES_BUILD_COMMIT 赋值：
+          #   elif request.tag is None:        ← 本 workflow 走这条（--commit、无 --tag）
+          #   if is_commit_tag(request.tag):   ← commit claim tag 构建，保持原样
+          # 用上下文锚定只替换 elif 分支那一处，仍然 fail-closed。
+          $di = (Resolve-Path 'scripts/bundles/desktop_inputs.py').Path
+          $t = [IO.File]::ReadAllText($di)
+          $pattern = '(?m)^(?<head>    elif request\.tag is None:\r?\n        )env\["HERMES_BUILD_COMMIT"\] = request\.commit'
+          $hits = [regex]::Matches($t, $pattern)
+          if ($hits.Count -ne 1) { throw "desktop_inputs.py: elif 分支赋值出现 $($hits.Count) 次（期望 1），拒绝盲目替换" }
+          $t = [regex]::Replace($t, $pattern, '${head}env.pop("HERMES_BUILD_COMMIT", None)  # CI: no sha7-suffixed identity')
+          [IO.File]::WriteAllText($di, $t, (New-Object System.Text.UTF8Encoding($false)))
+          git update-index --assume-unchanged scripts/bundles/desktop_inputs.py
+          Write-Host "  patched: scripts/bundles/desktop_inputs.py (elif tag is None only)"
           $status = @(git status --porcelain --untracked-files=all)
           if ($status.Count -gt 0) { throw ("工作区仍不干净（require_source 会失败）：`n" + ($status -join "`n")) }
           Select-String -Path scripts/bundles/desktop.py -Pattern 'targets = \{' | ForEach-Object { "  target -> " + $_.Line.Trim() }
